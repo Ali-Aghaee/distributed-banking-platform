@@ -1,0 +1,122 @@
+name: banking
+
+x-app: &app
+  image: ${IMAGE:-banking-platform:latest}
+  networks: [bank-net]
+
+x-pg: &pg
+  image: postgres:16
+  command: postgres -c max_prepared_transactions=200 -c max_connections=300
+  environment: { POSTGRES_USER: bank, POSTGRES_PASSWORD: bank, POSTGRES_DB: bank }
+  healthcheck: { test: ["CMD-SHELL", "pg_isready -U bank -d bank"], interval: 2s, timeout: 3s, retries: 30 }
+  networks: [bank-net]
+
+services:
+  # ---------------- databases ----------------
+  db-coord:
+    <<: *pg
+    container_name: db-coord
+    ports: ["5440:5432"]
+    volumes: [coord-data:/var/lib/postgresql/data, ./db/init-meta.sql:/docker-entrypoint-initdb.d/00-meta.sql:ro]
+  db-a:
+    <<: *pg
+    container_name: db-a
+    ports: ["5441:5432"]
+    volumes: [a-data:/var/lib/postgresql/data, ./db/schema.sql:/docker-entrypoint-initdb.d/00-schema.sql:ro, ./db/seed-a.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro]
+  db-b:
+    <<: *pg
+    container_name: db-b
+    ports: ["5442:5432"]
+    volumes: [b-data:/var/lib/postgresql/data, ./db/schema.sql:/docker-entrypoint-initdb.d/00-schema.sql:ro, ./db/seed-b.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro]
+  db-c:
+    <<: *pg
+    container_name: db-c
+    profiles: [shard-c]
+    ports: ["5443:5432"]
+    volumes: [c-data:/var/lib/postgresql/data, ./db/schema.sql:/docker-entrypoint-initdb.d/00-schema.sql:ro, ./db/seed-c.sql:/docker-entrypoint-initdb.d/10-seed.sql:ro]
+
+  # ---------------- control plane ----------------
+  gateway:
+    <<: *app
+    build: .
+    container_name: gateway
+    command: ["python", "-m", "app.gateway"]
+    environment: { META_URL: "postgresql://bank:bank@db-coord:5432/bank", COORDINATOR_URL: "http://coordinator:8000", LB_POLICY: "least_conn" }
+    ports: ["8000:8000"]
+    depends_on: { db-coord: { condition: service_healthy } }
+  coordinator:
+    <<: *app
+    container_name: coordinator
+    command: ["python", "-m", "app.coordinator"]
+    environment: { META_URL: "postgresql://bank:bank@db-coord:5432/bank" }
+    ports: ["8100:8000"]
+    depends_on: { db-coord: { condition: service_healthy } }
+
+  # ---------------- shard A / B replicas ----------------
+  bank-a1: &bank
+    <<: *app
+    container_name: bank-a1
+    command: ["python", "-m", "app.bank_server"]
+    labels: { bank.managed: "true", bank.shard: "A" }
+    environment: { REPLICA_NAME: bank-a1, SHARD: A, DB_URL: "postgresql://bank:bank@db-a:5432/bank", GATEWAY_URL: "http://gateway:8000" }
+    depends_on: { db-a: { condition: service_healthy } }
+  bank-a2:
+    <<: *bank
+    container_name: bank-a2
+    environment: { REPLICA_NAME: bank-a2, SHARD: A, DB_URL: "postgresql://bank:bank@db-a:5432/bank", GATEWAY_URL: "http://gateway:8000" }
+  bank-b1:
+    <<: *bank
+    container_name: bank-b1
+    labels: { bank.managed: "true", bank.shard: "B" }
+    environment: { REPLICA_NAME: bank-b1, SHARD: B, DB_URL: "postgresql://bank:bank@db-b:5432/bank", GATEWAY_URL: "http://gateway:8000" }
+    depends_on: { db-b: { condition: service_healthy } }
+  bank-b2:
+    <<: *bank
+    container_name: bank-b2
+    labels: { bank.managed: "true", bank.shard: "B" }
+    environment: { REPLICA_NAME: bank-b2, SHARD: B, DB_URL: "postgresql://bank:bank@db-b:5432/bank", GATEWAY_URL: "http://gateway:8000" }
+    depends_on: { db-b: { condition: service_healthy } }
+
+  # ---------------- Bonus I : Shard C + migrator (profile shard-c) ----------------
+  bank-c1:
+    <<: *bank
+    container_name: bank-c1
+    profiles: [shard-c]
+    labels: { bank.managed: "true", bank.shard: "C" }
+    environment: { REPLICA_NAME: bank-c1, SHARD: C, DB_URL: "postgresql://bank:bank@db-c:5432/bank", GATEWAY_URL: "http://gateway:8000" }
+    depends_on: { db-c: { condition: service_healthy } }
+  bank-c2:
+    <<: *bank
+    container_name: bank-c2
+    profiles: [shard-c]
+    labels: { bank.managed: "true", bank.shard: "C" }
+    environment: { REPLICA_NAME: bank-c2, SHARD: C, DB_URL: "postgresql://bank:bank@db-c:5432/bank", GATEWAY_URL: "http://gateway:8000" }
+    depends_on: { db-c: { condition: service_healthy } }
+  migrator:
+    <<: *app
+    container_name: migrator
+    profiles: [shard-c]
+    command: ["python", "-m", "app.migrator"]
+    environment:
+      META_URL: "postgresql://bank:bank@db-coord:5432/bank"
+    ports: ["8200:8000"]
+    depends_on: { db-coord: { condition: service_healthy }, db-c: { condition: service_healthy } }
+
+  # ---------------- Bonus II : self-healing controller (profile healing) ----------------
+  healer:
+    <<: *app
+    container_name: healer
+    profiles: [healing]
+    command: ["python", "-m", "app.healer"]
+    environment:
+      META_URL: "postgresql://bank:bank@db-coord:5432/bank"
+      GATEWAY_URL: "http://gateway:8000"
+      IMAGE: ${IMAGE:-banking-platform:latest}
+      NETWORK: bank-net
+    volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
+    ports: ["8300:8000"]
+    depends_on: { db-coord: { condition: service_healthy } }
+
+networks:
+  bank-net: { name: bank-net }
+volumes: { coord-data: {}, a-data: {}, b-data: {}, c-data: {} }

@@ -1,0 +1,1 @@
+-- Shard C starts empty; it receives data and ownership at runtime (live migration).
